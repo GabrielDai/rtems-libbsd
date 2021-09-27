@@ -70,7 +70,8 @@ _defaults = {
                    'ipsec-tools/src/libipsec',
                    'linux/include',
                    'linux/drivers/net/ethernet/freescale/fman',
-                   'rtemsbsd/sys'],
+                   'rtemsbsd/sys',
+                   'rtemsbsd/ptpd/src'],
         # User header paths
         'user': ['freebsd/crypto',
                  'freebsd/crypto/openssl/include',
@@ -5364,6 +5365,51 @@ class regulator(builder.Module):
         )
 
 #
+# PTPD
+#
+class ptpd(builder.Module):
+
+    def __init__(self, manager):
+        super(ptpd, self).__init__(manager, type(self).__name__)
+
+    def generate(self):
+        mm = self.manager
+        self.addRTEMSUserSourceFiles(
+            [
+                'ptpd/src/dep/iniparser/dictionary.c',
+                'ptpd/src/dep/iniparser/iniparser.c',
+                'ptpd/src/dep/ntpengine/ntp_isc_md5.c',
+                'ptpd/src/dep/ntpengine/ntpdcontrol.c',
+                'ptpd/src/dep/alarms.c',
+                'ptpd/src/dep/configdefaults.c',
+                'ptpd/src/dep/daemonconfig.c',
+                'ptpd/src/dep/eventtimer.c',
+                'ptpd/src/dep/eventtimer_kqueue.c',
+                'ptpd/src/dep/ipv4_acl.c',
+                'ptpd/src/dep/kqueue.c',
+                'ptpd/src/dep/msg.c',
+                'ptpd/src/dep/net.c',
+                'ptpd/src/dep/outlierfilter.c',
+                'ptpd/src/dep/servo.c',
+                'ptpd/src/dep/startup.c',
+                'ptpd/src/dep/statistics.c',
+                'ptpd/src/dep/sys.c',
+                'ptpd/src/arith.c',
+                'ptpd/src/bmc.c',
+                'ptpd/src/display.c',
+                'ptpd/src/management.c',
+                'ptpd/src/protocol.c',
+                'ptpd/src/ptp_timers.c',
+                'ptpd/src/ptpd.c',
+                'ptpd/src/signaling.c',
+                'ptpd/src/timingdomain.c',
+            ],
+            mm.generator['source'](['-DPTPD_NO_DAEMON',
+                                    '-DDATADIR=""',
+                                    '-DPACKAGE_NAME=""'])
+        )
+
+#
 # Tests
 #
 #  Note: Keep as the last module
@@ -5546,6 +5592,7 @@ def load(mm):
 
     mm.addModule(dhcpcd(mm))
     mm.addModule(mdnsresponder(mm))
+    mm.addModule(ptpd(mm))
 
     mm.addModule(tests(mm))
 
