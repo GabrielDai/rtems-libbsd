@@ -5403,6 +5403,8 @@ class ptpd(builder.Module):
                 'ptpd/src/ptpd.c',
                 'ptpd/src/signaling.c',
                 'ptpd/src/timingdomain.c',
+                'ptpd/rtems/ptpd.c',
+                'rtems/rtems-bsd-shell-ptpd.c',
             ],
             mm.generator['source'](['-DPTPD_NO_DAEMON',
                                     '-DDATADIR=""',

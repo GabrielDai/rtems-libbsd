@@ -86,6 +86,8 @@ int rtems_bsd_command_setkey(int argc, char **argv);
 
 int rtems_bsd_command_openssl(int argc, char **argv);
 
+int rtems_bsd_command_ptpd(int argc, char **argv);
+
 __END_DECLS
 
 #endif /* _RTEMS_BSD_MACHINE_RTEMS_BSD_COMMANDS_H_ */
