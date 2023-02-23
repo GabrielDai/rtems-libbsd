@@ -1717,6 +1717,23 @@ class nvme(builder.Module):
         )
 
 #
+# NIC GRETH
+#
+class dev_nic_greth_drvmgr(builder.Module):
+
+    def __init__(self, manager):
+        super(dev_nic_greth_drvmgr, self).__init__(manager, type(self).__name__)
+
+    def generate(self):
+        mm = self.manager
+        self.addRTEMSSourceFiles(
+            [
+                'sys/dev/greth/greth.c',
+            ],
+            mm.generator['source']()
+        )
+
+#
 # Networking
 #
 class net(builder.Module):
@@ -5283,6 +5300,7 @@ def load(mm):
     mm.addModule(dev_nic_dc(mm))
     mm.addModule(dev_nic_smc(mm))
     mm.addModule(dev_nic_broadcomm(mm))
+    mm.addModule(dev_nic_greth_drvmgr(mm))
 
     mm.addModule(nvme(mm))
     mm.addModule(imx(mm))
