@@ -7,6 +7,8 @@
  *  http://www.rtems.org/license/LICENSE.
  *
  *
+ *  2021      , Ported to rtems-libbsd.
+ *              Aerospace German Center (DLR SC-SRV)
  *  2008-12-10, Converted to driver manager and added support for
  *              multiple GRETH cores. <daniel@gaisler.com>
  *  2007-09-07, Ported GBIT support from 4.6.5
@@ -15,7 +17,6 @@
 #include <machine/rtems-bsd-kernel-space.h>
 
 #include <rtems.h>
-#define CPU_U32_FIX
 #include <bsp.h>
 
 #ifdef GRETH_SUPPORTED
@@ -29,19 +30,31 @@
 #include <rtems/error.h>
 #include <rtems/rtems_bsdnet.h>
 
-#include <grlib/greth.h>
-#include <drvmgr/drvmgr.h>
-#include <grlib/ambapp_bus.h>
+#include <dev/greth/greth.h>
 #include <grlib/ambapp.h>
 
 #include <sys/param.h>
 #include <sys/mbuf.h>
-
 #include <sys/socket.h>
 #include <sys/sockio.h>
+#include <sys/bus.h>
+#include <sys/kernel.h>
+#include <sys/module.h>
+#include <sys/sysctl.h>
+
+#include <dev/pci/pcireg.h>
+#include <dev/pci/pcivar.h>
+
 #include <net/if.h>
+#include <net/if_var.h>
+#include <net/if_types.h>
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
+
+#include <drvmgr/drvmgr.h>
+#include <grlib/ambapp_bus.h>
+
+#include <rtems/bsd/local/miibus_if.h>
 
 #ifdef malloc
 #undef malloc
@@ -51,12 +64,6 @@
 #endif
 
 #include <grlib/grlib_impl.h>
-
-#if defined(__m68k__)
-extern m68k_isr_entry set_vector( rtems_isr_entry, rtems_vector_number, int );
-#else
-extern rtems_isr_entry set_vector( rtems_isr_entry, rtems_vector_number, int );
-#endif
 
 
 /* #define GRETH_DEBUG */
@@ -134,6 +141,15 @@ typedef struct _greth_rxtxdesc {
    uint32_t *addr;         /* Buffer pointer */
 } greth_rxtxdesc;
 
+/* Gaisler vendor ID */
+#define PCIID_VENDOR_GAISLER 0x1ac8
+
+/* gr card */
+struct grcard_softc
+{
+    device_t dev;
+    struct drvmgr_dev* drvmgrDev[3];
+};
 
 /*
  * Per-device data
@@ -141,8 +157,10 @@ typedef struct _greth_rxtxdesc {
 struct greth_softc
 {
 
-   struct arpcom arpcom;
-   struct drvmgr_dev *dev;		/* Driver manager device */
+   device_t dev;
+   struct ifnet *ifp;
+   uint8_t macAddress[6];
+   struct drvmgr_dev *drvmgrDev;		/* Driver manager device */
    char devName[32];
 
    greth_regs *regs;
@@ -211,15 +229,58 @@ struct greth_softc
    SPIN_DECLARE(devlock);
 };
 
-int greth_process_tx_gbit(struct greth_softc *sc);
+/* Driver prototypes */
 int greth_process_tx(struct greth_softc *sc);
+int greth_process_tx_gbit(struct greth_softc *sc);
 
-static char *almalloc(int sz, int alignment)
+/* GRETH sysctls */
+static void greth_add_sysctls(device_t dev)
 {
-        char *tmp;
-        tmp = grlib_calloc(1, sz + (alignment-1));
-        tmp = (char *) (((int)tmp+alignment) & ~(alignment -1));
-        return(tmp);
+    struct greth_softc *sc = device_get_softc(dev);
+    struct sysctl_ctx_list *ctx;
+    struct sysctl_oid_list *statsnode;
+    struct sysctl_oid_list *child;
+    struct sysctl_oid *tree;
+
+    ctx = device_get_sysctl_ctx(dev);
+    child = SYSCTL_CHILDREN(device_get_sysctl_tree(dev));
+
+    tree = SYSCTL_ADD_NODE(ctx, child, OID_AUTO, "stats", CTLFLAG_RD,
+            NULL, "greth statistics");
+    statsnode = SYSCTL_CHILDREN(tree);
+
+    tree = SYSCTL_ADD_NODE(ctx, statsnode, OID_AUTO, "sw", CTLFLAG_RD,
+            NULL, "greth software statistics");
+    child = SYSCTL_CHILDREN(tree);
+
+    SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "rxInterrupts",
+            CTLFLAG_RD, &sc->rxInterrupts, 0,
+            "RX interrupts");
+    SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "rxPackets",
+            CTLFLAG_RD, &sc->rxPackets, 0,
+            "RX packets");
+    SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "rxLengthError",
+            CTLFLAG_RD, &sc->rxLengthError, 0,
+            "RX length errors");
+    SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "rxNonOctet",
+            CTLFLAG_RD, &sc->rxNonOctet, 0,
+            "RX non octet errors");
+    SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "rxBadCRC",
+            CTLFLAG_RD, &sc->rxBadCRC, 0,
+            "RX bad CRC errors");
+    SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "rxOverrun",
+            CTLFLAG_RD, &sc->rxOverrun, 0,
+            "RX overrun errors");
+    SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "txInterrupts",
+            CTLFLAG_RD, &sc->txInterrupts, 0,
+            "TX interrupts");
+
+    SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "max_fragsize",
+            CTLFLAG_RD, &sc->max_fragsize, 0,
+            "Max fragment size");
+    SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "gbit_mac",
+            CTLFLAG_RD, &sc->gbit_mac, 0,
+            "Gbit MAC");
 }
 
 /* GRETH interrupt handler */
@@ -261,11 +322,12 @@ static void greth_interrupt (void *arg)
 
         /* Send the event(s) */
         if ( events )
-            rtems_bsdnet_event_send(greth->daemonTid, events);
+            rtems_event_send(greth->daemonTid, events);
 }
 
-static uint32_t read_mii(struct greth_softc *sc, uint32_t phy_addr, uint32_t reg_addr)
+static uint32_t read_mii(device_t dev, int phy_addr, int reg_addr)
 {
+    struct greth_softc *sc = device_get_softc(dev);
     sc->phy_read_access++;
     while (sc->regs->mdio_ctrl & GRETH_MDIO_BUSY) {}
     sc->regs->mdio_ctrl = (phy_addr << 11) | (reg_addr << 6) | GRETH_MDIO_READ;
@@ -285,8 +347,9 @@ static uint32_t read_mii(struct greth_softc *sc, uint32_t phy_addr, uint32_t reg
     }
 }
 
-static void write_mii(struct greth_softc *sc, uint32_t phy_addr, uint32_t reg_addr, uint32_t data)
+static void write_mii(device_t dev, uint32_t phy_addr, uint32_t reg_addr, uint32_t data)
 {
+    struct greth_softc *sc = device_get_softc(dev);
     sc->phy_write_access++;
     while (sc->regs->mdio_ctrl & GRETH_MDIO_BUSY) {}
     sc->regs->mdio_ctrl =
@@ -336,46 +399,11 @@ static void print_init_info(struct greth_softc *sc)
 }
 
 /*
- * Generates the hash words based on CRCs of the enabled MAC addresses that are
- * allowed to be received. The allowed MAC addresses are maintained in a linked
- * "multi-cast" list available in the arpcom structure.
- *
- * Returns the number of MAC addresses that were processed (in the list)
- */
-static int
-greth_mac_filter_calc(struct arpcom *ac, uint32_t *msb, uint32_t *lsb)
-{
-    struct ether_multistep step;
-    struct ether_multi *enm;
-    int cnt = 0;
-    uint32_t crc, htindex, ht[2] = {0, 0};
-
-    /* Go through the Ethernet Multicast addresses one by one and add their
-     * CRC contribution to the MAC filter.
-     */
-    ETHER_FIRST_MULTI(step, ac, enm);
-    while (enm) {
-        crc = ether_crc32_be((uint8_t *)enm->enm_addrlo, 6);
-        htindex = crc & 0x3f;
-        ht[htindex >> 5] |= (1 << (htindex & 0x1F));
-        cnt++;
-        ETHER_NEXT_MULTI(step, enm);
-    }
-
-    if (cnt > 0) {
-        *msb = ht[1];
-        *lsb = ht[0];
-    }
-
-    return cnt;
-}
-
-/*
  * Initialize the ethernet hardware
  */
 static int greth_mac_filter_set(struct greth_softc *sc)
 {
-    struct ifnet *ifp = &sc->arpcom.ac_if;
+    struct ifnet *ifp = sc->ifp;
     uint32_t hash_msb, hash_lsb, ctrl;
     SPIN_IRQFLAGS(flags);
 
@@ -392,11 +420,6 @@ static int greth_mac_filter_set(struct greth_softc *sc)
         ctrl |= GRETH_CTRL_MCE;
         hash_msb = 0xFFFFFFFF;
         hash_lsb = 0xFFFFFFFF;
-    } else if (greth_mac_filter_calc(&sc->arpcom, &hash_msb, &hash_lsb) > 0) {
-        /* Generate hash for MAC filtering out multicast addresses */
-        ctrl |= GRETH_CTRL_MCE;
-    } else {
-        /* Multicast list is empty .. disable multicast */
     }
     SPIN_LOCK_IRQ(&sc->devlock, flags);
     sc->regs->ht_msb = hash_msb;
@@ -423,7 +446,7 @@ greth_initialize_hardware (struct greth_softc *sc)
     int tmp2;
     struct timespec tstart, tnow;
     greth_regs *regs;
-    unsigned int advmodes, speed, tabsize;
+    unsigned int advmodes, speed;
 
     regs = sc->regs;
 
@@ -463,16 +486,16 @@ greth_initialize_hardware (struct greth_softc *sc)
      * Wait for old reset (if asserted by boot loader) to complete, otherwise
      * power-down instruction might not have any effect.
      */
-    while (read_mii(sc, phyaddr, 0) & 0x8000) {}
-    write_mii(sc, phyaddr, 0, 0x0800); /* Power-down */
-    write_mii(sc, phyaddr, 0, 0x0000); /* Power-Up */
-    write_mii(sc, phyaddr, 0, 0x8000); /* Reset */
+    while (read_mii(sc->dev, phyaddr, 0) & 0x8000) {}
+    write_mii(sc->dev, phyaddr, 0, 0x0800); /* Power-down */
+    write_mii(sc->dev, phyaddr, 0, 0x0000); /* Power-Up */
+    write_mii(sc->dev, phyaddr, 0, 0x8000); /* Reset */
 
     /* We wait about 30ms */
     rtems_task_wake_after(rtems_clock_get_ticks_per_second()/32);
 
     /* Wait for reset to complete and get default values */
-    while ((phyctrl = read_mii(sc, phyaddr, 0)) & 0x8000) {}
+    while ((phyctrl = read_mii(sc->dev, phyaddr, 0)) & 0x8000) {}
 
     /* Set up PHY advertising modes for auto-negotiation */
     advmodes = sc->advmodes;
@@ -485,19 +508,19 @@ greth_initialize_hardware (struct greth_softc *sc)
      * know that we have/haven't GBit capability. The MAC may not support
      * Gbit even though PHY does...
      */
-    phystatus = read_mii(sc, phyaddr, 1);
+    phystatus = read_mii(sc->dev, phyaddr, 1);
     if (phystatus & 0x0100) {
-        tmp1 = read_mii(sc, phyaddr, 9);
+        tmp1 = read_mii(sc->dev, phyaddr, 9);
         tmp1 &= ~0x300;
         if (advmodes & GRETH_ADV_1000_FD)
             tmp1 |= 0x200;
         if (advmodes & GRETH_ADV_1000_HD)
             tmp1 |= 0x100;
-        write_mii(sc, phyaddr, 9, tmp1);
+        write_mii(sc->dev, phyaddr, 9, tmp1);
     }
 
     /* Optionally limit the 10/100 modes as configured by user */
-    tmp1 = read_mii(sc, phyaddr, 4);
+    tmp1 = read_mii(sc->dev, phyaddr, 4);
     tmp1 &= ~0x1e0;
     if (advmodes & GRETH_ADV_100_FD)
         tmp1 |= 0x100;
@@ -507,12 +530,12 @@ greth_initialize_hardware (struct greth_softc *sc)
         tmp1 |= 0x040;
     if (advmodes & GRETH_ADV_10_HD)
         tmp1 |= 0x020;
-    write_mii(sc, phyaddr, 4, tmp1);
+    write_mii(sc->dev, phyaddr, 4, tmp1);
 
     /* If autonegotiation implemented we start it */
     if (phystatus & 0x0008) {
-        write_mii(sc, phyaddr, 0, phyctrl | 0x1200);
-        phyctrl = read_mii(sc, phyaddr, 0);
+        write_mii(sc->dev, phyaddr, 0, phyctrl | 0x1200);
+        phyctrl = read_mii(sc->dev, phyaddr, 0);
     }
 
     /* Check if PHY is autoneg capable and then determine operating mode, 
@@ -521,19 +544,19 @@ greth_initialize_hardware (struct greth_softc *sc)
     sc->fd = 0;
     sc->sp = 0;
     sc->auto_neg = 0;
-    timespecclear(&sc->auto_neg_time);
+    _Timespec_Set_to_zero(&sc->auto_neg_time);
     if ((phyctrl >> 12) & 1) {
             /*wait for auto negotiation to complete*/
             sc->auto_neg = 1;
             if (rtems_clock_get_uptime(&tstart) != RTEMS_SUCCESSFUL)
                     printk("rtems_clock_get_uptime failed\n");
-            while (!(((phystatus = read_mii(sc, phyaddr, 1)) >> 5) & 1)) {
+            while (!(((phystatus = read_mii(sc->dev, phyaddr, 1)) >> 5) & 1)) {
                     if (rtems_clock_get_uptime(&tnow) != RTEMS_SUCCESSFUL)
                             printk("rtems_clock_get_uptime failed\n");
-                    timespecsub(&tnow, &tstart, &sc->auto_neg_time);
-                    if (timespeccmp(&sc->auto_neg_time, &greth_tan, >)) {
+                    _Timespec_Subtract(&tstart, &tnow, &sc->auto_neg_time);
+                    if (_Timespec_Greater_than(&sc->auto_neg_time, &greth_tan)) {
                             sc->auto_neg = -1; /* Failed */
-                            tmp1 = read_mii(sc, phyaddr, 0);
+                            tmp1 = read_mii(sc->dev, phyaddr, 0);
                             sc->gb = ((phyctrl >> 6) & 1) && !((phyctrl >> 13) & 1);
                             sc->sp = !((phyctrl >> 6) & 1) && ((phyctrl >> 13) & 1);
                             sc->fd = (phyctrl >> 8) & 1;
@@ -542,11 +565,11 @@ greth_initialize_hardware (struct greth_softc *sc)
                     /* Wait about 30ms, time is PHY dependent */
                     rtems_task_wake_after(rtems_clock_get_ticks_per_second()/32);
             }
-            sc->phydev.adv = read_mii(sc, phyaddr, 4);
-            sc->phydev.part = read_mii(sc, phyaddr, 5);
+            sc->phydev.adv = read_mii(sc->dev, phyaddr, 4);
+            sc->phydev.part = read_mii(sc->dev, phyaddr, 5);
             if ((phystatus >> 8) & 1) {
-                    sc->phydev.extadv = read_mii(sc, phyaddr, 9);
-                    sc->phydev.extpart = read_mii(sc, phyaddr, 10);
+                    sc->phydev.extadv = read_mii(sc->dev, phyaddr, 9);
+                    sc->phydev.extpart = read_mii(sc->dev, phyaddr, 10);
                        if ( (sc->phydev.extadv & GRETH_MII_EXTADV_1000HD) &&
                             (sc->phydev.extpart & GRETH_MII_EXTPRT_1000HD)) {
                                sc->gb = 1;
@@ -577,12 +600,12 @@ auto_neg_done:
     sc->phydev.vendor = 0;
     sc->phydev.device = 0;
     sc->phydev.rev = 0;
-    phystatus = read_mii(sc, phyaddr, 1);
+    phystatus = read_mii(sc->dev, phyaddr, 1);
 
     /* Read out PHY info if extended registers are available */
     if (phystatus & 1) {  
-            tmp1 = read_mii(sc, phyaddr, 2);
-            tmp2 = read_mii(sc, phyaddr, 3);
+            tmp1 = read_mii(sc->dev, phyaddr, 2);
+            tmp2 = read_mii(sc->dev, phyaddr, 3);
 
             sc->phydev.vendor = (tmp1 << 6) | ((tmp2 >> 10) & 0x3F);
             sc->phydev.rev = tmp2 & 0xF;
@@ -591,18 +614,18 @@ auto_neg_done:
 
     /* Force to 10 mbit half duplex if the 10/100 MAC is used with a 1000 PHY */
     if (((sc->gb) && !(sc->gbit_mac)) || !((phyctrl >> 12) & 1)) {
-        write_mii(sc, phyaddr, 0, sc->sp << 13);
+        write_mii(sc->dev, phyaddr, 0, sc->sp << 13);
 
         /* check if marvell 88EE1111 PHY. Needs special reset handling */
         if ((phystatus & 1) && (sc->phydev.vendor == 0x005043) &&
             (sc->phydev.device == 0x0C))
-            write_mii(sc, phyaddr, 0, 0x8000);
+            write_mii(sc->dev, phyaddr, 0, 0x8000);
 
         sc->gb = 0;
         sc->sp = 0;
         sc->fd = 0;
     }
-    while ((read_mii(sc, phyaddr, 0)) & 0x8000) {}
+    while ((read_mii(sc->dev, phyaddr, 0)) & 0x8000) {}
 
     if (sc->greth_rst) {
         /* Reset ON */
@@ -617,9 +640,8 @@ auto_neg_done:
     /* Initialize rx/tx descriptor table pointers. Due to alignment we 
      * always allocate maximum table size.
      */
-    tabsize = sc->num_descs * 8;
-    sc->txdesc = (greth_rxtxdesc *) almalloc(tabsize * 2, tabsize);
-    sc->rxdesc = (greth_rxtxdesc *) (tabsize + (void *)sc->txdesc);
+    sc->txdesc = m_cljget(NULL, M_WAITOK, MCLBYTES);
+    sc->rxdesc = (greth_rxtxdesc *) &sc->txdesc[128];
     sc->tx_ptr = 0;
     sc->tx_dptr = 0;
     sc->tx_cnt = 0;
@@ -629,12 +651,12 @@ auto_neg_done:
      * the GRETH core can understand
      */
     drvmgr_translate_check(
-        sc->dev,
+        sc->drvmgrDev,
         CPUMEM_TO_DMA,
         (void *)sc->txdesc,
         (void **)&sc->txdesc_remote,
-        tabsize * 2);
-    sc->rxdesc_remote = sc->txdesc_remote + tabsize;
+        0x800);
+    sc->rxdesc_remote = sc->txdesc_remote + 0x400;
     regs->txdesc = (int) sc->txdesc_remote;
     regs->rxdesc = (int) sc->rxdesc_remote;
 
@@ -646,43 +668,39 @@ auto_neg_done:
         sc->txdesc[i].ctrl = 0;
         if (!(sc->gbit_mac)) {
             drvmgr_translate_check(
-                sc->dev, 
+                sc->drvmgrDev,
                 CPUMEM_TO_DMA,
-                (void *)grlib_malloc(GRETH_MAXBUF_LEN),
+                m_cljget(NULL, M_WAITOK, MCLBYTES),
                 (void **)&sc->txdesc[i].addr,
                 GRETH_MAXBUF_LEN);
         }
-#ifdef GRETH_DEBUG
-              /* printf("TXBUF: %08x\n", (int) sc->txdesc[i].addr); */
-#endif
-      }
+        DBG("TXBUF: %08x\n", (int) sc->txdesc[i].addr);
+    }
     for (i = 0; i < sc->rxbufs; i++)
       {
-         MGETHDR (m, M_WAIT, MT_DATA);
-          MCLGET (m, M_WAIT);
+         MGETHDR (m, M_WAITOK, MT_DATA);
+          MCLGET (m, M_WAITOK);
           if (sc->gbit_mac)
                   m->m_data += 2;
-	  m->m_pkthdr.rcvif = &sc->arpcom.ac_if;
+	  m->m_pkthdr.rcvif = sc->ifp;
           sc->rxmbuf[i] = m;
           drvmgr_translate_check(
-            sc->dev,
+            sc->drvmgrDev,
             CPUMEM_TO_DMA,
             (void *)mtod(m, uint32_t *),
             (void **)&sc->rxdesc[i].addr,
             GRETH_MAXBUF_LEN);
           sc->rxdesc[i].ctrl = GRETH_RXD_ENABLE | GRETH_RXD_IRQ;
-#ifdef GRETH_DEBUG
-/* 	  printf("RXBUF: %08x\n", (int) sc->rxdesc[i].addr); */
-#endif
+          DBG("RXBUF: %08x\n", (int) sc->rxdesc[i].addr);
       }
     sc->rxdesc[sc->rxbufs - 1].ctrl |= GRETH_RXD_WRAP;
 
     /* set ethernet address.  */
     regs->mac_addr_msb = 
-      sc->arpcom.ac_enaddr[0] << 8 | sc->arpcom.ac_enaddr[1];
+      sc->macAddress[0] << 8 | sc->macAddress[1];
     regs->mac_addr_lsb = 
-      sc->arpcom.ac_enaddr[2] << 24 | sc->arpcom.ac_enaddr[3] << 16 |
-      sc->arpcom.ac_enaddr[4] << 8 | sc->arpcom.ac_enaddr[5];
+      sc->macAddress[2] << 24 | sc->macAddress[3] << 16 |
+      sc->macAddress[4] << 8 | sc->macAddress[5];
 
     if ( sc->rxbufs < 10 ) {
         sc->tx_int_gen = sc->tx_int_gen_cur = 1;
@@ -698,7 +716,11 @@ auto_neg_done:
     regs->status = 0xffffffff;
 
     /* install interrupt handler */
-    drvmgr_interrupt_register(sc->dev, 0, "greth", greth_interrupt, sc);
+    int status = drvmgr_interrupt_register(sc->drvmgrDev, 0, "greth", greth_interrupt, sc);
+    if(status != RTEMS_SUCCESSFUL)
+    {
+        printk("Error: Interrupt registration of greth_interrupt failed");
+    }
 
     regs->ctrl |= GRETH_CTRL_RXEN | GRETH_CTRL_RXIRQ;
 
@@ -725,8 +747,7 @@ void ipalign(struct mbuf *m)
   if ((((int) m->m_data) & 2) && (m->m_len)) {
     last = (unsigned int *) ((((int) m->m_data) + m->m_len + 8) & ~3);
     first = (unsigned int *) (((int) m->m_data) & ~3);
-		/* tmp = *first << 16; */
-		asm volatile (" lda [%1] 1, %0\n" : "=r"(tmp) : "r"(first) );
+    tmp = GRETH_MEM_LOAD(first);
 		tmp = tmp << 16;
     first++;
     do {
@@ -735,7 +756,7 @@ void ipalign(struct mbuf *m)
 			 ** Load with forced cache miss
 			 * data = *first; 
 			 */
-      asm volatile (" lda [%1] 1, %0\n" : "=r"(data) : "r"(first) );
+      data = GRETH_MEM_LOAD(first);
       *first = tmp | (data >> 16);
       tmp = data << 16;
       first++;
@@ -746,12 +767,34 @@ void ipalign(struct mbuf *m)
 }
 #endif
 
+void swap_bytes(volatile uint32_t* dWord)
+{
+    (*dWord) =
+        ((*dWord) & 0xff000000) >> 24 |
+        ((*dWord) & 0x00ff0000) >> 8 |
+        ((*dWord) & 0x0000ff00) << 8 |
+        ((*dWord) & 0x000000ff) << 24;
+}
+
+void change_endianness(struct mbuf *m)
+{
+    volatile uint32_t len = m->m_len;
+    volatile uint32_t* dWord;
+
+    volatile uint32_t i = 0;
+    for (i = 0; i < len; i = i + 4)
+    {
+        dWord = mtodo(m, i);
+        swap_bytes(dWord);
+    }
+}
+
 static void
 greth_Daemon (void *arg)
 {
     struct ether_header *eh;
     struct greth_softc *dp = (struct greth_softc *) arg;
-    struct ifnet *ifp = &dp->arpcom.ac_if;
+    struct ifnet *ifp = dp->ifp;
     struct mbuf *m;
     unsigned int len, len_status, bad;
     rtems_event_set events;
@@ -762,7 +805,7 @@ greth_Daemon (void *arg)
 
     for (;;)
       {
-        rtems_bsdnet_event_receive (INTERRUPT_EVENT | GRETH_TX_WAIT_EVENT,
+        rtems_event_receive (INTERRUPT_EVENT | GRETH_TX_WAIT_EVENT,
                                     RTEMS_WAIT | RTEMS_EVENT_ANY,
                                     RTEMS_NO_TIMEOUT, &events);
         
@@ -824,28 +867,22 @@ again:
                             m = dp->rxmbuf[dp->rx_ptr];
 #ifdef GRETH_DEBUG
                             int i;
-                            printf("RX: 0x%08x, Len: %d : ", (int) m->m_data, len);
+                            printk("RX: 0x%08x, Len: %d : ", (int) m->m_data, len);
                             for (i=0; i<len; i++)
-                                    printf("%x%x", (m->m_data[i] >> 4) & 0x0ff, m->m_data[i] & 0x0ff);
-                            printf("\n");
+                                    printk("%x%x", (m->m_data[i] >> 4) & 0x0ff, m->m_data[i] & 0x0ff);
+                            printk("\n");
 #endif
-                            m->m_len = m->m_pkthdr.len =
-                                    len - sizeof (struct ether_header);
-
-                            eh = mtod (m, struct ether_header *);
-
-                            m->m_data += sizeof (struct ether_header);
+                            m->m_len = m->m_pkthdr.len = len;
+                            change_endianness(m);
 #ifdef CPU_U32_FIX
+                            eh = mtod (m, struct ether_header *);
                             if(!dp->gbit_mac) {
                                     /* OVERRIDE CACHED ETHERNET HEADER FOR NON-SNOOPING SYSTEMS */
-                                    addr = (unsigned int)eh;
-                                    asm volatile (" lda [%1] 1, %0\n" : "=r"(tmp) : "r"(addr) );
-                                    addr+=4;
-                                    asm volatile (" lda [%1] 1, %0\n" : "=r"(tmp) : "r"(addr) );
-                                    addr+=4;
-                                    asm volatile (" lda [%1] 1, %0\n" : "=r"(tmp) : "r"(addr) );
-                                    addr+=4;
-                                    asm volatile (" lda [%1] 1, %0\n" : "=r"(tmp) : "r"(addr) );
+                                    tmp = GRETH_MEM_LOAD((uintptr_t)eh);
+                                    tmp = GRETH_MEM_LOAD(4 + (uintptr_t)eh);
+                                    tmp = GRETH_MEM_LOAD(8 + (uintptr_t)eh);
+                                    tmp = GRETH_MEM_LOAD(12 + (uintptr_t)eh);
+                                    (void)tmp;
 
                                     ipalign(m);	/* Align packet on 32-bit boundary */
                             }
@@ -855,15 +892,15 @@ again:
                                     rtems_cache_invalidate_entire_data();
                             }
 */
-                            ether_input (ifp, eh, m);
-                            MGETHDR (m, M_WAIT, MT_DATA);
-                            MCLGET (m, M_WAIT);
+                            (*ifp->if_input)(ifp, m);
+                            MGETHDR (m, M_WAITOK, MT_DATA);
+                            MCLGET (m, M_WAITOK);
                             if (dp->gbit_mac)
                                     m->m_data += 2;
                             dp->rxmbuf[dp->rx_ptr] = m;
                             m->m_pkthdr.rcvif = ifp;
                             drvmgr_translate_check(
-                                dp->dev,
+                                dp->drvmgrDev,
                                 CPUMEM_TO_DMA,
                                 (void *)mtod (m, uint32_t *),
                                 (void **)&dp->rxdesc[dp->rx_ptr].addr,
@@ -915,22 +952,34 @@ sendpacket (struct ifnet *ifp, struct mbuf *m)
 
     len = 0;
     temp = (unsigned char *) GRETH_MEM_LOAD(&dp->txdesc[dp->tx_ptr].addr);
-    drvmgr_translate(dp->dev, CPUMEM_FROM_DMA, (void *)temp, (void **)&temp);
-#ifdef GRETH_DEBUG
-    printf("TXD: 0x%08x : BUF: 0x%08x\n", (int) m->m_data, (int) temp);
-#endif
+    drvmgr_translate(dp->drvmgrDev, CPUMEM_FROM_DMA, (void *)temp, (void **)&temp);
+    DBG("TXD: 0x%08x : BUF: 0x%08x\n", (int) m->m_data, (int) temp);
     for (;;)
     {
 #ifdef GRETH_DEBUG
             int i;
-            printf("MBUF: 0x%08x : ", (int) m->m_data);
+            printk("MBUF: 0x%08x : ", (int) m->m_data);
             for (i=0;i<m->m_len;i++)
-                    printf("%x%x", (m->m_data[i] >> 4) & 0x0ff, m->m_data[i] & 0x0ff);
-            printf("\n");
+                    printk("%02x ", m->m_data[i] & 0x0ff);
+            printk("\n");
 #endif
             len += m->m_len;
             if (len <= RBUF_SIZE)
+            {
+                    uint32_t remainig_bytes = m->m_len % 4;
+                    m->m_len = m->m_len - remainig_bytes;
+                    change_endianness(m);
                     memcpy ((void *) temp, (char *) m->m_data, m->m_len);
+
+                    if (remainig_bytes)
+                    {
+                            volatile uint32_t* dWord = mtodo(m, m->m_len);
+                            uint32_t bytes = 0;
+                            bytes |= (*dWord) & (0x00ffffff >> (4 * (3 - remainig_bytes)));
+                            swap_bytes(&bytes);
+                            memcpy ((void *) (temp + m->m_len), (char *) &bytes, 4);
+                    }
+            }
             temp += m->m_len;
             if ((m = m->m_next) == NULL)
                     break;
@@ -971,9 +1020,7 @@ sendpacket_gbit (struct ifnet *ifp, struct mbuf *m)
         SPIN_IRQFLAGS(flags);
 
         len = 0;
-#ifdef GRETH_DEBUG
-        printf("TXD: 0x%08x\n", (int) m->m_data);
-#endif
+        DBG("TXD: 0x%08x\n", (int) m->m_data);
         /* Get number of fragments too see if we have enough
          * resources.
          */
@@ -1017,14 +1064,14 @@ sendpacket_gbit (struct ifnet *ifp, struct mbuf *m)
                 
 #ifdef GRETH_DEBUG
             int i;
-            printf("MBUF: 0x%08x, Len: %d : ", (int) m->m_data, m->m_len);
+            printk("MBUF: 0x%08x, Len: %d : ", (int) m->m_data, m->m_len);
             for (i=0; i<m->m_len; i++)
-                printf("%x%x", (m->m_data[i] >> 4) & 0x0ff, m->m_data[i] & 0x0ff);
-            printf("\n");
+                printk("%02x", m->m_data[i] & 0x0ff);
+            printk("\n");
 #endif
             len += m->m_len;
             drvmgr_translate_check(
-                dp->dev,
+                dp->drvmgrDev,
                 CPUMEM_TO_DMA,
                 (void *)(uint32_t *)m->m_data,
                 (void **)&dp->txdesc[dp->tx_ptr].addr,
@@ -1065,7 +1112,7 @@ sendpacket_gbit (struct ifnet *ifp, struct mbuf *m)
 
 int greth_process_tx_gbit(struct greth_softc *sc)
 {
-    struct ifnet *ifp = &sc->arpcom.ac_if;
+    struct ifnet *ifp = sc->ifp;
     struct mbuf *m;
     SPIN_IRQFLAGS(flags);
     int first=1;
@@ -1095,7 +1142,7 @@ int greth_process_tx_gbit(struct greth_softc *sc)
                  * makes the stack enter at greth_start next time
                  * a packet is to be sent.
                  */
-                ifp->if_flags &= ~IFF_OACTIVE;
+                ifp->if_flags &= ~IFF_DRV_OACTIVE;
                 break;
             }
         }
@@ -1118,7 +1165,7 @@ int greth_process_tx_gbit(struct greth_softc *sc)
             if ( first ){
                 first = 0;
                 SPIN_LOCK_IRQ(&sc->devlock, flags);
-                ifp->if_flags |= IFF_OACTIVE;
+                ifp->if_flags |= IFF_DRV_OACTIVE;
                 sc->regs->ctrl |= GRETH_CTRL_TXIRQ;
                 SPIN_UNLOCK_IRQ(&sc->devlock, flags);
                 
@@ -1139,7 +1186,7 @@ int greth_process_tx_gbit(struct greth_softc *sc)
 
 int greth_process_tx(struct greth_softc *sc)
 {
-    struct ifnet *ifp = &sc->arpcom.ac_if;
+    struct ifnet *ifp = sc->ifp;
     struct mbuf *m;
     SPIN_IRQFLAGS(flags);
     int first=1;
@@ -1162,7 +1209,7 @@ int greth_process_tx(struct greth_softc *sc)
                  * makes the stack enter at greth_start next time
                  * a packet is to be sent.
                  */
-                ifp->if_flags &= ~IFF_OACTIVE;
+                ifp->if_flags &= ~IFF_DRV_OACTIVE;
                 break;
             }
         }
@@ -1184,7 +1231,7 @@ int greth_process_tx(struct greth_softc *sc)
             if ( first ){
                 first = 0;
                 SPIN_LOCK_IRQ(&sc->devlock, flags);
-                ifp->if_flags |= IFF_OACTIVE;
+                ifp->if_flags |= IFF_DRV_OACTIVE;
                 sc->regs->ctrl |= GRETH_CTRL_TXIRQ;
                 SPIN_UNLOCK_IRQ(&sc->devlock, flags);
 
@@ -1208,7 +1255,7 @@ greth_start (struct ifnet *ifp)
 {
     struct greth_softc *sc = ifp->if_softc;
     
-    if ( ifp->if_flags & IFF_OACTIVE )
+    if ( ifp->if_flags & IFF_DRV_OACTIVE )
             return;
     
     if ( sc->gbit_mac ){
@@ -1229,8 +1276,8 @@ greth_start (struct ifnet *ifp)
 static void
 greth_init (void *arg)
 {
-    struct greth_softc *sc = arg;
-    struct ifnet *ifp = &sc->arpcom.ac_if;
+    struct greth_softc *sc = (struct greth_softc *)arg;
+    struct ifnet *ifp = sc->ifp;
     char name[4] = {'E', 'T', 'H', '0'};
 
     if (sc->daemonTid == 0)
@@ -1256,7 +1303,7 @@ greth_init (void *arg)
     /*
      * Tell the world that we're running.
      */
-    ifp->if_flags |= IFF_RUNNING;
+    ifp->if_drv_flags |= IFF_DRV_RUNNING;
 }
 
 /*
@@ -1265,12 +1312,12 @@ greth_init (void *arg)
 static void
 greth_stop (struct greth_softc *sc)
 {
-    struct ifnet *ifp = &sc->arpcom.ac_if;
+    struct ifnet *ifp = sc->ifp;
     SPIN_IRQFLAGS(flags);
     unsigned int speed;
 
     SPIN_LOCK_IRQ(&sc->devlock, flags);
-    ifp->if_flags &= ~IFF_RUNNING;
+    ifp->if_drv_flags &= ~IFF_DRV_RUNNING;
 
     speed = sc->regs->ctrl & (GRETH_CTRL_GB | GRETH_CTRL_SP | GRETH_CTRL_FULLD);
 
@@ -1284,24 +1331,6 @@ greth_stop (struct greth_softc *sc)
     SPIN_UNLOCK_IRQ(&sc->devlock, flags);
 
     sc->next_tx_mbuf = NULL;
-}
-
-
-/*
- * Show interface statistics
- */
-static void
-greth_stats (struct greth_softc *sc)
-{
-  printf ("      Rx Interrupts:%-8lu", sc->rxInterrupts);
-  printf ("      Rx Packets:%-8lu", sc->rxPackets);
-  printf ("          Length:%-8lu", sc->rxLengthError);
-  printf ("       Non-octet:%-8lu\n", sc->rxNonOctet);
-  printf ("            Bad CRC:%-8lu", sc->rxBadCRC);
-  printf ("         Overrun:%-8lu", sc->rxOverrun);
-  printf ("      Tx Interrupts:%-8lu", sc->txInterrupts);
-  printf ("      Maximal Frags:%-8d", sc->max_fragsize);
-  printf ("      GBIT MAC:%-8d", sc->gbit_mac);
 }
 
 /*
@@ -1322,9 +1351,9 @@ greth_ioctl (struct ifnet *ifp, ioctl_command_t command, caddr_t data)
 	  break;
 
       case SIOCSIFFLAGS:
-	  switch (ifp->if_flags & (IFF_UP | IFF_RUNNING))
+      switch ((ifp->if_flags & IFF_UP) | (ifp->if_drv_flags & IFF_DRV_RUNNING))
 	    {
-	    case IFF_RUNNING:
+	    case IFF_DRV_RUNNING:
 		greth_stop (sc);
                 break;
 
@@ -1332,7 +1361,7 @@ greth_ioctl (struct ifnet *ifp, ioctl_command_t command, caddr_t data)
 		greth_init (sc);
 		break;
 
-	    case IFF_UP | IFF_RUNNING:
+	    case IFF_UP | IFF_DRV_RUNNING:
 		greth_stop (sc);
 		greth_init (sc);
 		break;
@@ -1340,26 +1369,6 @@ greth_ioctl (struct ifnet *ifp, ioctl_command_t command, caddr_t data)
 		break;
 	    }
 	  break;
-
-      case SIO_RTEMS_SHOW_STATS:
-	  greth_stats (sc);
-	  break;
-
-	  /*
-	   * Multicast commands: Enabling/disabling filtering of MAC addresses
-	   */
-      case SIOCADDMULTI:
-      case SIOCDELMULTI:
-      ifr = (struct ifreq *)data;
-      if (command == SIOCADDMULTI) {
-        error = ether_addmulti(ifr, &sc->arpcom);
-      } else {
-        error = ether_delmulti(ifr, &sc->arpcom);
-      }
-      if (error == ENETRESET) {
-        error = greth_mac_filter_set(sc);
-      }
-      break;
 
       default:
 	  error = EINVAL;
@@ -1373,162 +1382,26 @@ greth_ioctl (struct ifnet *ifp, ioctl_command_t command, caddr_t data)
  * Attach an GRETH driver to the system
  */
 static int
-greth_interface_driver_attach (
-    struct rtems_bsdnet_ifconfig *config,
-    int attach
-    )
+greth_interface_driver_attach(device_t dev)
 {
     struct greth_softc *sc;
     struct ifnet *ifp;
-    int mtu;
     int unitNumber;
-    char *unitName;
-    
-      /* parse driver name */
-    if ((unitNumber = rtems_bsdnet_parse_driver_name (config, &unitName)) < 0)
-	return 0;
+    int8_t eaddr[ETHER_ADDR_LEN];
 
-    sc = config->drv_ctrl;
-    ifp = &sc->arpcom.ac_if;
-#ifdef GRETH_DEBUG
-    printf("GRETH[%d]: %s, sc %p, dev %p on %s\n", unitNumber, config->ip_address, sc, sc->dev, sc->dev->parent->dev->name);
-#endif
-    if (config->hardware_address)
-      {
-	  memcpy (sc->arpcom.ac_enaddr, config->hardware_address,
-		  ETHER_ADDR_LEN);
-      }
-    else
-      {
-	  memset (sc->arpcom.ac_enaddr, 0x08, ETHER_ADDR_LEN);
-      }
+    sc = device_get_softc(dev);
+    unitNumber = device_get_unit(dev);
+    if (unitNumber < 0)
+        return 1;
 
-    if (config->mtu)
-	mtu = config->mtu;
-    else
-	mtu = ETHERMTU;
-
-    sc->acceptBroadcast = !config->ignore_broadcast;
-
-    /*
-     * Set up network interface values
-     */
-    ifp->if_softc = sc;
-    ifp->if_unit = unitNumber;
-    ifp->if_name = unitName;
-    ifp->if_mtu = mtu;
-    ifp->if_init = greth_init;
-    ifp->if_ioctl = greth_ioctl;
-    ifp->if_start = greth_start;
-    ifp->if_output = ether_output;
-    ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX;
-    if (sc->mc_available)
-        ifp->if_flags |= IFF_MULTICAST;
-    if (ifp->if_snd.ifq_maxlen == 0)
-	ifp->if_snd.ifq_maxlen = ifqmaxlen;
-
-    /*
-     * Attach the interface
-     */
-    if_attach (ifp);
-    ether_ifattach (ifp);
-
-#ifdef GRETH_DEBUG
-    printf ("GRETH : driver has been attached\n");
-#endif
-    return 1;
-}
-
-/******************* Driver manager interface ***********************/
-
-/* Driver prototypes */
-int greth_register_io(rtems_device_major_number *m);
-int greth_device_init(struct greth_softc *sc);
-int network_interface_add(struct rtems_bsdnet_ifconfig *interface);
-
-#ifdef GRETH_INFO_AVAIL
-static int greth_info(
-	struct drvmgr_dev *dev,
-	void (*print_line)(void *p, char *str),
-	void *p, int argc, char *argv[]);
-#define GRETH_INFO_FUNC greth_info
-#else
-#define GRETH_INFO_FUNC NULL
-#endif
-
-int greth_init2(struct drvmgr_dev *dev);
-int greth_init3(struct drvmgr_dev *dev);
-
-struct drvmgr_drv_ops greth_ops = 
-{
-	.init	=
-		{
-			NULL,
-			greth_init2,
-			greth_init3,
-			NULL
-		},
-	.remove = NULL,
-	.info = GRETH_INFO_FUNC,
-};
-
-struct amba_dev_id greth_ids[] = 
-{
-	{VENDOR_GAISLER, GAISLER_ETHMAC},
-	{0, 0}		/* Mark end of table */
-};
-
-struct amba_drv_info greth_drv_info =
-{
-	{
-		DRVMGR_OBJ_DRV,			/* Driver */
-		NULL,				/* Next driver */
-		NULL,				/* Device list */
-		DRIVER_AMBAPP_GAISLER_GRETH_ID,	/* Driver ID */
-		"GRETH_DRV",			/* Driver Name */
-		DRVMGR_BUS_TYPE_AMBAPP,		/* Bus Type */
-		&greth_ops,
-		NULL,				/* Funcs */
-		0,				/* No devices yet */
-		0,
-	},
-	&greth_ids[0]
-};
-
-void greth_register_drv (void)
-{
-	DBG("Registering GRETH driver\n");
-	drvmgr_drv_register(&greth_drv_info.general);
-}
-
-int greth_init2(struct drvmgr_dev *dev)
-{
-	struct greth_softc *priv;
-
-	DBG("GRETH[%d] on bus %s\n", dev->minor_drv, dev->parent->dev->name);
-	priv = dev->priv = grlib_calloc(1, sizeof(*priv));
-	if ( !priv )
-		return DRVMGR_NOMEM;
-	priv->dev = dev;
-
-	/* This core will not find other cores, so we wait for init3() */
-
-	return DRVMGR_OK;
-}
-
-int greth_init3(struct drvmgr_dev *dev)
-{
-    struct greth_softc *sc;
-    struct rtems_bsdnet_ifconfig *ifp;
-    rtems_status_code status;
-
-    sc = dev->priv;
-    sprintf(sc->devName, "gr_eth%d", (dev->minor_drv+1));
+    struct grcard_softc* grcard_sc = device_get_softc(device_get_parent(dev));
+    sc->drvmgrDev = grcard_sc->drvmgrDev[unitNumber];
 
     /* Init GRETH device */
-    if ( greth_device_init(sc) ) {
-        printk("GRETH: Failed to init device\n");
-        return DRVMGR_FAIL;
+    if (greth_device_init(sc))
+    {
+        printk("GRETH[%d]: Failed to init device\n", unitNumber);
+        return 1;
     }
 
     /* Initialize Spin-lock for GRSPW Device. This is to protect
@@ -1536,19 +1409,40 @@ int greth_init3(struct drvmgr_dev *dev)
      */
     SPIN_INIT(&sc->devlock, sc->devName);
 
-    /* Register GRETH device as an Network interface */
-    ifp = grlib_calloc(1, sizeof(*ifp));
+    sc->dev = dev;
+    sc->ifp = ifp = if_alloc(IFT_ETHER);
 
-    ifp->name = sc->devName;
-    ifp->drv_ctrl = sc;
-    ifp->attach = greth_interface_driver_attach;
+    DBG("GRETH[%d], sc %p, drvmgr dev %p on %s\n", unitNumber, sc, sc->drvmgrDev, sc->drvmgrDev->parent->dev->name);
 
-    status = network_interface_add(ifp);
-    if (status != 0) {
-        return DRVMGR_FAIL;
-    }
+    rtems_bsd_get_mac_address(device_get_name(sc->dev), unitNumber, eaddr);
 
-    return DRVMGR_OK;
+    memcpy(sc->macAddress, eaddr, ETHER_ADDR_LEN);
+
+    /*
+     * Set up network interface values
+     */
+    ifp->if_softc = sc;
+    if_initname(ifp, device_get_name(dev), device_get_unit(dev));
+    ifp->if_init = greth_init;
+    ifp->if_ioctl = greth_ioctl;
+    ifp->if_start = greth_start;
+    ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX;
+    if (sc->mc_available)
+        ifp->if_flags |= IFF_MULTICAST;
+    IFQ_SET_MAXLEN(&ifp->if_snd, ifqmaxlen);
+    ifp->if_snd.ifq_drv_maxlen = ifqmaxlen;
+    IFQ_SET_READY(&ifp->if_snd);
+
+    /*
+     * Attach the interface
+     */
+    ether_ifattach(ifp, eaddr);
+
+    greth_add_sysctls(dev);
+
+    DBG("GRETH : driver has been attached\n");
+
+    return 0;
 }
 
 int greth_device_init(struct greth_softc *sc)
@@ -1557,23 +1451,22 @@ int greth_device_init(struct greth_softc *sc)
     struct ambapp_core *pnpinfo;
     union drvmgr_key_value *value;
     unsigned int speed;
-    int i, nrd;
 
     /* Get device information from AMBA PnP information */
-    ambadev = (struct amba_dev_info *)sc->dev->businfo;
+    ambadev = (struct amba_dev_info *)sc->drvmgrDev->businfo;
     if ( ambadev == NULL ) {
         return -1;
     }
     pnpinfo = &ambadev->info;
     sc->regs = (greth_regs *)pnpinfo->apb_slv->start;
-    sc->minor = sc->dev->minor_drv;
+    sc->minor = sc->drvmgrDev->minor_drv;
     sc->greth_rst = 1;
 
     /* Remember EDCL enabled/disable state before reset */
     sc->edcl_dis = sc->regs->ctrl & GRETH_CTRL_ED;
 
     /* Default is to inherit EDCL Disable bit from HW. User can force En/Dis */
-    value = drvmgr_dev_key_get(sc->dev, "edclDis", DRVMGR_KT_INT);
+    value = drvmgr_dev_key_get(sc->drvmgrDev, "edclDis", DRVMGR_KT_INT);
     if ( value ) {
         /* Force EDCL mode. Has an effect later when GRETH+PHY is initialized */
         if (value->i > 0) {
@@ -1586,7 +1479,7 @@ int greth_device_init(struct greth_softc *sc)
     }
 
     /* let user control soft-reset of GRETH (for debug) */
-    value = drvmgr_dev_key_get(sc->dev, "soft-reset", DRVMGR_KT_INT);
+    value = drvmgr_dev_key_get(sc->drvmgrDev, "soft-reset", DRVMGR_KT_INT);
     if ( value) {
         sc->greth_rst = value->i ? 1 : 0;
     }
@@ -1611,24 +1504,19 @@ int greth_device_init(struct greth_softc *sc)
     sc->rxbufs = 32;
     sc->phyaddr = -1;
 
-    /* Probe the number of descriptors available the */
-    nrd = (sc->regs->status & GRETH_STATUS_NRD) >> 24;
-    for (sc->num_descs = 128, i = 0; i < nrd; i++)
-        sc->num_descs = sc->num_descs * 2;
-
-    value = drvmgr_dev_key_get(sc->dev, "txDescs", DRVMGR_KT_INT);
-    if ( value && (value->i <= sc->num_descs) )
+    value = drvmgr_dev_key_get(sc->drvmgrDev, "txDescs", DRVMGR_KT_INT);
+    if ( value && (value->i <= 128) )
         sc->txbufs = value->i;
 
-    value = drvmgr_dev_key_get(sc->dev, "rxDescs", DRVMGR_KT_INT);
-    if ( value && (value->i <= sc->num_descs) )
+    value = drvmgr_dev_key_get(sc->drvmgrDev, "rxDescs", DRVMGR_KT_INT);
+    if ( value && (value->i <= 128) )
         sc->rxbufs = value->i;
 
-    value = drvmgr_dev_key_get(sc->dev, "phyAdr", DRVMGR_KT_INT);
+    value = drvmgr_dev_key_get(sc->drvmgrDev, "phyAdr", DRVMGR_KT_INT);
     if ( value && (value->i < 32) )
         sc->phyaddr = value->i;
 
-    value = drvmgr_dev_key_get(sc->dev, "advModes", DRVMGR_KT_INT);
+    value = drvmgr_dev_key_get(sc->drvmgrDev, "advModes", DRVMGR_KT_INT);
     if ( value )
         sc->advmodes = value->i;
 
@@ -1638,26 +1526,95 @@ int greth_device_init(struct greth_softc *sc)
     return 0;
 }
 
-#ifdef GRETH_INFO_AVAIL
-static int greth_info(
-	struct drvmgr_dev *dev,
-	void (*print_line)(void *p, char *str),
-	void *p, int argc, char *argv[])
+static int
+greth_probe(device_t dev)
 {
-	struct greth_softc *sc;
-	char buf[64];
-
-	if (dev->priv == NULL)
-		return -DRVMGR_EINVAL;
-	sc = dev->priv;
-
-	sprintf(buf, "IFACE NAME:  %s", sc->devName);
-	print_line(p, buf);
-	sprintf(buf, "GBIT MAC:    %s", sc->gbit_mac ? "YES" : "NO");
-	print_line(p, buf);
-
-	return DRVMGR_OK;
+    return BUS_PROBE_DEFAULT;
 }
-#endif
 
-#endif
+
+/* grcard device methods */
+static int
+grcard_probe(device_t dev)
+{
+    int error;
+
+    uint32_t vendorId = pci_get_vendor(dev);
+    if (vendorId == PCIID_VENDOR_GAISLER)
+    {
+        DBG("Gaisler card found\n");
+        error = BUS_PROBE_DEFAULT;
+    }
+    else
+    {
+        error = ENXIO;
+    }
+
+    return (error);
+}
+
+static int
+grcard_attach(device_t dev)
+{
+    struct grcard_softc* sc = device_get_softc(dev);
+    sc->dev = dev;
+
+    struct drvmgr_dev* drvmgrDev = drvmgr_dev_by_name("GAISLER_ETHMAC");
+    if (drvmgrDev == NULL)
+    {
+        printk(" No GAISLER_ETHMAC device found\n");
+        return 1;
+    }
+
+    device_t child;
+    uint8_t i;
+    for (i = 0; i < sizeof(sc->drvmgrDev) / sizeof(sc->drvmgrDev[0]); i++)
+    {
+        sc->drvmgrDev[i] = drvmgrDev;
+        drvmgrDev = drvmgrDev->next;
+
+        child = device_add_child(dev, "greth", -1);
+        device_probe_and_attach(child);
+    }
+
+    return 0;
+}
+
+/* Newbus definitions for grcard*/
+static device_method_t grcard_methods[] = {
+    DEVMETHOD(device_probe,		grcard_probe),
+    DEVMETHOD(device_attach,	grcard_attach),
+    DEVMETHOD_END
+};
+
+static driver_t grcard_driver = {
+    "grcard",
+    grcard_methods,
+    sizeof(struct grcard_softc)
+};
+
+static devclass_t grcard_devclass;
+DRIVER_MODULE(grcard, pci, grcard_driver, grcard_devclass, 0, 0);
+MODULE_DEPEND(grcard, pci, 1, 1, 1);
+
+
+/* Newbus definitions for greth*/
+static device_method_t greth_drvmgr_methods[] = {
+    DEVMETHOD(device_probe,		greth_probe),
+    DEVMETHOD(device_attach,	greth_interface_driver_attach),
+    DEVMETHOD(miibus_readreg,	read_mii),
+    DEVMETHOD(miibus_writereg,	write_mii),
+    DEVMETHOD_END
+};
+
+static driver_t greth_drvmgr_driver = {
+    "greth",
+    greth_drvmgr_methods,
+    sizeof(struct greth_softc)
+};
+
+static devclass_t greth_drvmgr_devclass;
+DRIVER_MODULE(greth, grcard, greth_drvmgr_driver, greth_drvmgr_devclass, 0, 0);
+MODULE_DEPEND(greth, grcard, 1, 1, 1);
+
+#endif /* GRETH_SUPPORTED */
